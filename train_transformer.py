@@ -16,6 +16,9 @@ import itertools
 import multiprocessing
 from shutil import copyfile
 
+import horovod.torch as hvd
+import torch.multiprocessing as mp
+
 random.seed(1234)
 torch.manual_seed(1234)
 np.random.seed(1234)
@@ -152,10 +155,13 @@ if __name__ == '__main__':
     parser.add_argument('--logs_folder', type=str, default='tensorboard_logs')
     parser.add_argument('--N_enc', type=int, default=1)
     parser.add_argument('--N_dec', type=int, default=1)
+    parser.add_argument('--N_dec', type=int, default=1)
 
     args = parser.parse_args()
-    print(args)
 
+    args.cuda = not args.no_cuda and torch.cuda.is_available()
+
+    print(args)
     print('Transformer Training')
 
     writer = SummaryWriter(log_dir=os.path.join(args.logs_folder, args.exp_name))
@@ -166,6 +172,25 @@ if __name__ == '__main__':
     # Pipeline for text
     text_field = TextField(init_token='<bos>', eos_token='<eos>', lower=True, tokenize='spacy',
                            remove_punctuation=True, nopoints=False)
+
+        # Horovod: initialize library.
+    hvd.init()
+    torch.manual_seed(args.seed)
+
+    if args.cuda:
+        # Horovod: pin GPU to local rank.
+        torch.cuda.set_device(hvd.local_rank())
+        torch.cuda.manual_seed(args.seed)
+
+    # Horovod: limit # of CPU threads to be used per worker.
+    torch.set_num_threads(1)
+
+    kwargs = {'num_workers': 1, 'pin_memory': True} if args.cuda else {}
+    # When supported, use 'forkserver' to spawn dataloader workers instead of 'fork' to prevent
+    # issues with Infiniband implementations that are not fork-safe
+    if (kwargs.get('num_workers', 0) > 0 and hasattr(mp, '_supports_context') and
+            mp._supports_context and 'forkserver' in mp.get_all_start_methods()):
+        kwargs['multiprocessing_context'] = 'forkserver'
 
     # Create the dataset
     dataset = COCO(image_field, text_field, 'coco/images/', args.annotation_folder, args.annotation_folder)
@@ -197,8 +222,17 @@ if __name__ == '__main__':
 
 
     # Initial conditions
-    optim = Adam(model.parameters(), lr=1, betas=(0.9, 0.98))
+    optim = Adam(model.parameters(), lr=1, betas=(0.9, 0.98), c)
+
+    # Horovod: wrap optimizer with DistributedOptimizer.
+    optim = hvd.DistributedOptimizer(optim, named_parameters=model.named_parameters())
+
     scheduler = LambdaLR(optim, lambda_lr)
+
+    # Horovod: (optional) compression algorithm.
+    # compression = hvd.Compression.fp16 if args.fp16_allreduce else hvd.Compression.none
+
+
     loss_fn = NLLLoss(ignore_index=text_field.vocab.stoi['<pad>'])
     use_rl = False
     best_cider = .0
@@ -227,15 +261,35 @@ if __name__ == '__main__':
             print('Resuming from epoch %d, validation loss %f, and best cider %f' % (
                 data['epoch'], data['val_loss'], data['best_cider']))
 
+
+    # Horovod Distribute Sampler
+    train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset,
+                                                                    num_replicas=hvd.size(), rank=hvd.rank())
+
+    val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset,
+                                                                  num_replicas=hvd.size(), rank=hvd.rank())
+
+    dict_train_sampler = torch.utils.data.distributed.DistributedSampler(dict_dataset_train,
+                                                                         num_replicas=hvd.size(), rank=hvd.rank())
+
+    dict_val_sampler = torch.utils.data.distributed.DistributedSampler(dict_dataset_val,
+                                                                       num_replicas=hvd.size(), rank=hvd.rank())
+
+    dict_test_sampler = torch.utils.data.distributed.DistributedSampler(dict_dataset_test,
+                                                                        num_replicas=hvd.size(), rank=hvd.rank())
+
     print("Training starts")
     for e in range(start_epoch, start_epoch + 100):
         dataloader_train = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.workers,
-                                      drop_last=True)
-        dataloader_val = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.workers)
+                                      drop_last=True, sampler=train_sampler, **kwargs)
+        dataloader_val = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.workers,
+                                    sampler=val_sampler, **kwargs)
         dict_dataloader_train = DataLoader(dict_dataset_train, batch_size=args.batch_size // 5, shuffle=True,
-                                           num_workers=args.workers)
-        dict_dataloader_val = DataLoader(dict_dataset_val, batch_size=args.batch_size // 5)
-        dict_dataloader_test = DataLoader(dict_dataset_test, batch_size=args.batch_size // 5)
+                                           num_workers=args.workers, sampler=dict_train_sampler, **kwargs)
+        dict_dataloader_val = DataLoader(dict_dataset_val, batch_size=args.batch_size // 5,
+                                         sampler=dict_val_sampler, **kwargs)
+        dict_dataloader_test = DataLoader(dict_dataset_test, batch_size=args.batch_size // 5,
+                                          sampler=dict_test_sampler, **kwargs)
 
         if not use_rl:
             train_loss = train_xe(model, dataloader_train, optim, text_field)
