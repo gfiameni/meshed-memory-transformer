@@ -150,6 +150,7 @@ if __name__ == '__main__':
     parser.add_argument('--features_path', type=str)
     parser.add_argument('--annotation_folder', type=str)
     parser.add_argument('--logs_folder', type=str, default='tensorboard_logs')
+    parser.add_argument('--N_enc', type=int, default=1)
     args = parser.parse_args()
     print(args)
 
@@ -176,7 +177,7 @@ if __name__ == '__main__':
         text_field.vocab = pickle.load(open('vocab_%s.pkl' % args.exp_name, 'rb'))
 
     # Model and dataloaders
-	encoder = LinearEncoder(args.N_enc, 0)
+    encoder = LinearEncoder(args.N_enc, 0)
     decoder = Decoder(len(text_field.vocab), 54, args.N_dec, text_field.vocab.stoi['<pad>'])
     model = Transformer(text_field.vocab.stoi['<bos>'], encoder, decoder).to(device)
 
