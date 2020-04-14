@@ -21,7 +21,7 @@ class Transformer(CaptioningModel):
 
     def init_weights(self):
         for p in self.parameters():
-            if p.dim() > 1:
+            if p.dim() > 1 and p.requires_grad == True:
                 nn.init.xavier_uniform_(p)
 
     def forward(self, images, seq, *args):
