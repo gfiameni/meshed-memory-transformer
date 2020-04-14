@@ -263,20 +263,17 @@ if __name__ == '__main__':
 
 
     # Horovod Distribute Sampler
-    train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset,
-                                                                    num_replicas=hvd.size(), rank=hvd.rank())
+    train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, num_replicas=hvd.size(), rank=hvd.rank())
+    val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset, num_replicas=hvd.size(), rank=hvd.rank())
 
-    val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset,
-                                                                  num_replicas=hvd.size(), rank=hvd.rank())
+    dict_train_sampler = torch.utils.data.distributed.DistributedSampler(dict_dataset_train, num_replicas=hvd.size(), rank=hvd.rank())
 
-    dict_train_sampler = torch.utils.data.distributed.DistributedSampler(dict_dataset_train,
-                                                                         num_replicas=hvd.size(), rank=hvd.rank())
+    dict_val_sampler = torch.utils.data.distributed.DistributedSampler(dict_dataset_val, num_replicas=hvd.size(), rank=hvd.rank())
 
-    dict_val_sampler = torch.utils.data.distributed.DistributedSampler(dict_dataset_val,
-                                                                       num_replicas=hvd.size(), rank=hvd.rank())
+    dict_test_sampler = torch.utils.data.distributed.DistributedSampler(dict_dataset_test, num_replicas=hvd.size(), rank=hvd.rank())
 
-    dict_test_sampler = torch.utils.data.distributed.DistributedSampler(dict_dataset_test,
-                                                                        num_replicas=hvd.size(), rank=hvd.rank())
+    # Broadcast parameters from rank 0 to all other processes.
+    hvd.broadcast_parameters(model.state_dict(), root_rank=0)
 
     print("Training starts")
     for e in range(start_epoch, start_epoch + 100):
