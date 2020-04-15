@@ -222,7 +222,7 @@ if __name__ == '__main__':
 
 
     # Initial conditions
-    optim = Adam(model.parameters(), lr=1, betas=(0.9, 0.98), c)
+    optim = Adam(model.parameters(), lr=1, betas=(0.9, 0.98))
 
     # Horovod: wrap optimizer with DistributedOptimizer.
     optim = hvd.DistributedOptimizer(optim, named_parameters=model.named_parameters())
