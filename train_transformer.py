@@ -155,7 +155,6 @@ if __name__ == '__main__':
     parser.add_argument('--logs_folder', type=str, default='tensorboard_logs')
     parser.add_argument('--N_enc', type=int, default=1)
     parser.add_argument('--N_dec', type=int, default=1)
-    parser.add_argument('--N_dec', type=int, default=1)
 
     args = parser.parse_args()
 
