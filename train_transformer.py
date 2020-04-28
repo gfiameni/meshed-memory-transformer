@@ -18,6 +18,13 @@ from shutil import copyfile
 
 import horovod.torch as hvd
 import torch.multiprocessing as mp
+from apex import amp
+
+import torch.cuda.profiler as profiler
+import torch.cuda.nvtx as nvtx
+from apex import pyprof
+pyprof.nvtx.init()
+
 
 random.seed(1234)
 torch.manual_seed(1234)
@@ -31,7 +38,7 @@ def evaluate_loss(model, dataloader, loss_fn, text_field):
     with tqdm(desc='Epoch %d - validation' % e, unit='it', total=len(dataloader)) as pbar:
         with torch.no_grad():
             for it, (detections, captions) in enumerate(dataloader):
-                detections, captions = detections.to(device), captions.to(device)
+                detections, captions = detections.to(device, non_blocking=True), captions.to(device, non_blocking=True)
                 out = model(detections, captions)
                 captions = captions[:, 1:].contiguous()
                 out = out[:, :-1].contiguous()
@@ -53,7 +60,7 @@ def evaluate_metrics(model, dataloader, text_field):
     gts = {}
     with tqdm(desc='Epoch %d - evaluation' % e, unit='it', total=len(dataloader)) as pbar:
         for it, (images, caps_gt) in enumerate(iter(dataloader)):
-            images = images.to(device)
+            images = images.to(device, non_blocking=True)
             with torch.no_grad():
                 out, _ = model.beam_search(images, 20, text_field.vocab.stoi['<eos>'], 5, out_size=1)
             caps_gen = text_field.decode(out, join_words=False)
@@ -74,23 +81,40 @@ def train_xe(model, dataloader, optim, text_field):
     model.train()
     # scheduler.step()
     running_loss = .0
+
+
+
     with tqdm(desc='Epoch %d - train' % e, unit='it', total=len(dataloader)) as pbar:
-        for it, (detections, captions) in enumerate(dataloader):
-            detections, captions = detections.to(device), captions.to(device)
-            out = model(detections, captions)
-            optim.zero_grad()
-            captions_gt = captions[:, 1:].contiguous()
-            out = out[:, :-1].contiguous()
-            loss = loss_fn(out.view(-1, len(text_field.vocab)), captions_gt.view(-1))
-            loss.backward()
+        with torch.autograd.profiler.emit_nvtx():
+            for it, (detections, captions) in enumerate(dataloader):
+                detections, captions = detections.to(device, non_blocking=True ), captions.to(device, non_blocking=True )
+                out = model(detections, captions)
 
-            optim.step()
-            this_loss = loss.item()
-            running_loss += this_loss
+                if args.use_amp:
+                    optim.synchronize()
+                    
+                optim.zero_grad()
+                captions_gt = captions[:, 1:].contiguous()
+                out = out[:, :-1].contiguous()
+                loss = loss_fn(out.view(-1, len(text_field.vocab)), captions_gt.view(-1))
 
-            pbar.set_postfix(loss=running_loss / (it + 1))
-            pbar.update()
-            scheduler.step()
+                if args.use_amp:
+                    with amp.scale_loss(loss, optim) as scaled_loss:
+                        scaled_loss.backward()
+                else:
+                    loss.backward()
+
+                if args.use_amp:
+                    optim.skip_synchronize()
+                else:
+                    optim.step()
+
+                this_loss = loss.item()
+                running_loss += this_loss
+
+                pbar.set_postfix(loss=running_loss / (it + 1))
+                pbar.update()
+                scheduler.step()
 
     loss = running_loss / len(dataloader)
     return loss
@@ -108,9 +132,13 @@ def train_scst(model, dataloader, optim, cider, text_field):
 
     with tqdm(desc='Epoch %d - train' % e, unit='it', total=len(dataloader)) as pbar:
         for it, (detections, caps_gt) in enumerate(dataloader):
-            detections = detections.to(device)
+            detections = detections.to(device, non_blocking=True )
             outs, log_probs = model.beam_search(detections, seq_len, text_field.vocab.stoi['<eos>'],
                                                 beam_size, out_size=beam_size)
+
+            if args.use_amp:
+                optim.synchronize()
+
             optim.zero_grad()
 
             # Rewards
@@ -118,13 +146,22 @@ def train_scst(model, dataloader, optim, cider, text_field):
             caps_gt = list(itertools.chain(*([c, ] * beam_size for c in caps_gt)))
             caps_gen, caps_gt = tokenizer_pool.map(evaluation.PTBTokenizer.tokenize, [caps_gen, caps_gt])
             reward = cider.compute_score(caps_gt, caps_gen)[1].astype(np.float32)
-            reward = torch.from_numpy(reward).to(device).view(detections.shape[0], beam_size)
+            reward = torch.from_numpy(reward).to(device, non_blocking=True).view(detections.shape[0], beam_size)
             reward_baseline = torch.mean(reward, -1, keepdim=True)
             loss = -torch.mean(log_probs, -1) * (reward - reward_baseline)
 
             loss = loss.mean()
-            loss.backward()
-            optim.step()
+
+            if args.use_amp:
+                with amp.scale_loss(loss, optim) as scaled_loss:
+                    scaled_loss.backward()
+            else:
+                loss.backward()
+
+            if args.use_amp:
+                optim.skip_synchronize()
+            else:
+                optim.step()
 
             running_loss += loss.item()
             running_reward += reward.mean().item()
@@ -155,10 +192,11 @@ if __name__ == '__main__':
     parser.add_argument('--logs_folder', type=str, default='tensorboard_logs')
     parser.add_argument('--N_enc', type=int, default=1)
     parser.add_argument('--N_dec', type=int, default=1)
+    parser.add_argument('--use_amp', action='store_true')
 
     args = parser.parse_args()
 
-    args.cuda = not args.no_cuda and torch.cuda.is_available()
+    args.cuda = torch.cuda.is_available()
 
     print(args)
     print('Transformer Training')
@@ -166,25 +204,27 @@ if __name__ == '__main__':
     writer = SummaryWriter(log_dir=os.path.join(args.logs_folder, args.exp_name))
 
     # Pipeline for image regions
+    nvtx.range_push("Image Detection Field")
     image_field = ImageDetectionsField(detections_path=args.features_path, max_detections=50, load_in_tmp=False)
+    nvtx.range_pop()
 
     # Pipeline for text
     text_field = TextField(init_token='<bos>', eos_token='<eos>', lower=True, tokenize='spacy',
                            remove_punctuation=True, nopoints=False)
 
-        # Horovod: initialize library.
+    # Horovod: initialize library.
     hvd.init()
-    torch.manual_seed(args.seed)
+    torch.manual_seed(1)
 
     if args.cuda:
         # Horovod: pin GPU to local rank.
         torch.cuda.set_device(hvd.local_rank())
-        torch.cuda.manual_seed(args.seed)
+        torch.cuda.manual_seed(1)
 
     # Horovod: limit # of CPU threads to be used per worker.
-    torch.set_num_threads(1)
+    # torch.set_num_threads(1)
 
-    kwargs = {'num_workers': 1, 'pin_memory': True} if args.cuda else {}
+    kwargs = {'pin_memory': True} if args.cuda else {}
     # When supported, use 'forkserver' to spawn dataloader workers instead of 'fork' to prevent
     # issues with Infiniband implementations that are not fork-safe
     if (kwargs.get('num_workers', 0) > 0 and hasattr(mp, '_supports_context') and
@@ -193,6 +233,7 @@ if __name__ == '__main__':
 
     # Create the dataset
     dataset = COCO(image_field, text_field, 'coco/images/', args.annotation_folder, args.annotation_folder)
+    type(dataset)
     train_dataset, val_dataset, test_dataset = dataset.splits
 
     if not os.path.isfile('vocab_%s.pkl' % args.exp_name):
@@ -205,7 +246,7 @@ if __name__ == '__main__':
     # Model and dataloaders
     encoder = LinearEncoder(args.N_enc, 0)
     decoder = Decoder(len(text_field.vocab), 54, args.N_dec, text_field.vocab.stoi['<pad>'])
-    model = Transformer(text_field.vocab.stoi['<bos>'], encoder, decoder).to(device)
+    model = Transformer(text_field.vocab.stoi['<bos>'], encoder, decoder).to(device, non_blocking=True)
 
     dict_dataset_train = train_dataset.image_dictionary({'image': image_field, 'text': RawField()})
     ref_caps_train = list(train_dataset.text)
@@ -225,6 +266,9 @@ if __name__ == '__main__':
 
     # Horovod: wrap optimizer with DistributedOptimizer.
     optim = hvd.DistributedOptimizer(optim, named_parameters=model.named_parameters())
+
+    if args.use_amp:
+        model, optim = amp.initialize(model, optim, opt_level="O1")
 
     scheduler = LambdaLR(optim, lambda_lr)
 
@@ -273,24 +317,24 @@ if __name__ == '__main__':
 
     # Broadcast parameters from rank 0 to all other processes.
     hvd.broadcast_parameters(model.state_dict(), root_rank=0)
+    hvd.broadcast_optimizer_state(optim, root_rank=0)
+
+
+    dataloader_train = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, drop_last=True, sampler=train_sampler, **kwargs)
+    dataloader_val = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, sampler=val_sampler, **kwargs)
+    dict_dataloader_train = DataLoader(dict_dataset_train, batch_size=args.batch_size // 5, shuffle=False, num_workers=args.workers, sampler=dict_train_sampler, **kwargs)
+    dict_dataloader_val = DataLoader(dict_dataset_val, batch_size=args.batch_size // 5, sampler=dict_val_sampler, **kwargs)
+    dict_dataloader_test = DataLoader(dict_dataset_test, batch_size=args.batch_size // 5, sampler=dict_test_sampler, **kwargs)
 
     print("Training starts")
-    for e in range(start_epoch, start_epoch + 100):
-        dataloader_train = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.workers,
-                                      drop_last=True, sampler=train_sampler, **kwargs)
-        dataloader_val = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.workers,
-                                    sampler=val_sampler, **kwargs)
-        dict_dataloader_train = DataLoader(dict_dataset_train, batch_size=args.batch_size // 5, shuffle=True,
-                                           num_workers=args.workers, sampler=dict_train_sampler, **kwargs)
-        dict_dataloader_val = DataLoader(dict_dataset_val, batch_size=args.batch_size // 5,
-                                         sampler=dict_val_sampler, **kwargs)
-        dict_dataloader_test = DataLoader(dict_dataset_test, batch_size=args.batch_size // 5,
-                                          sampler=dict_test_sampler, **kwargs)
+    for e in range(start_epoch, start_epoch + 1000):
 
         if not use_rl:
             train_loss = train_xe(model, dataloader_train, optim, text_field)
             writer.add_scalar('data/train_loss', train_loss, e)
         else:
+            hvd.broadcast_optimizer_state(optim, root_rank=0)
+
             train_loss, reward, reward_baseline = train_scst(model, dict_dataloader_train, optim, cider_train, text_field)
             writer.add_scalar('data/train_loss', train_loss, e)
             writer.add_scalar('data/reward', reward, e)

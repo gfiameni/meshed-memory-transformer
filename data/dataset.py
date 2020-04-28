@@ -53,6 +53,13 @@ class Dataset(object):
             for x in self.examples:
                 yield getattr(x, attr)
 
+    # custom memory pinning method on custom type
+    # Giuseppe
+    def pin_memory(self):
+        self.examples = self.examples.pin_memory()
+        self.fields = self.fields.pin_memory()
+        return self
+
 
 class ValueDataset(Dataset):
     def __init__(self, examples, fields, dictionary):
@@ -177,6 +184,13 @@ class PairedDataset(Dataset):
     def splits(self):
         raise NotImplementedError
 
+    # custom memory pinning method on custom type
+    # Giuseppe
+    def pin_memory(self):
+        self.image_field = self.image_field.pin_memory()
+        self.text_field = self.text_field.pin_memory()
+        return self
+
 
 class COCO(PairedDataset):
     def __init__(self, image_field, text_field, img_root, ann_root, id_root=None, use_restval=True,
@@ -227,6 +241,7 @@ class COCO(PairedDataset):
         val_split = PairedDataset(self.val_examples, self.fields)
         test_split = PairedDataset(self.test_examples, self.fields)
         return train_split, val_split, test_split
+
 
     @classmethod
     def get_samples(cls, roots, ids_dataset=None):

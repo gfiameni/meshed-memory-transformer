@@ -1,0 +1,15 @@
+/ideas
+output*
+/models
+/output_logs/*
+/evaluation/*
+/data/annotations/
+/data/coco_detections.hdf5
+/data/.ipynb_checkpoints/
+/data/__pycache__/
+.ipynb_checkpoints/
+/saved_models/
+/tensorboard_logs/
+vocab_*
+**/__pycache__/**
+
